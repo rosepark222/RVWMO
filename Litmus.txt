@@ -1,0 +1,63 @@
+ 
+In the world of memory consistency, these "cases" are formally known as Litmus Tests. They are the standard benchmarks used to define what a hardware architecture (like RISC-V) can and cannot do.
+To answer your first question: there are hundreds of variations, but they are all built from about 5 to 8 "Primitive" patterns. Most researchers focus on the ones that highlight the difference between "Strong" models (like TSO/x86) and "Weak" models (like RVWMO).
+Here are the most well-known cases beyond MP and WRC, along with the checking analysis for RVWMO.
+ 
+
+
+1. SB (Store Buffer / Dekker's)
+Description: Each hart stores to its own variable and tries to read the other's.
+Code: * Hart 0: S1: [A]=1; L1: r1=[B]
+Hart 1: S2: [B]=1; L2: r2=[A]
+Outcome to Check: r1=0, r2=0
+The Cycle: S1 -po-> L1 -fr-> S2 -po-> L2 -fr-> S1
+TSO/RVWMO: Allowed in both (unless fences are added).
+2. MP (Message Passing)
+Description: Data is written, then a flag is set. The observer sees the flag but misses the data.
+Code: * Hart 0: S1: [Data]=100; S2: [Flag]=1
+Hart 1: L1: r1=[Flag]; L2: r2=[Data]
+Outcome to Check: r1=1, r2=0
+The Cycle: S1 -po-> S2 -rf-> L1 -po-> L2 -fr-> S1
+TSO: Forbidden (PO is strictly enforced).
+RVWMO: Allowed (Requires Fence or Acquire/Release to forbid).
+3. WRC (Write-to-Read-and-Write / Relay)
+Description: Hart 1 "passes the baton" from Hart 0 to Hart 2.
+Code: * Hart 0: S1: [A]=1
+Hart 1: L1: r1=[A]; S2: [B]=1
+Hart 2: L2: r2=[B]; L3: r3=[A]
+Outcome to Check: r1=1, r2=1, r3=0
+The Cycle: S1 -rf-> L1 -po-> S2 -rf-> L2 -po-> L3 -fr-> S1
+TSO: Forbidden.
+RVWMO: Allowed (Needs a chain of dependencies or fences to forbid).
+4. LB (Load Buffering)
+Description: Two harts read a value and then store a value to the other's address.
+Code: * Hart 0: L1: r1=[A]; S1: [B]=1
+Hart 1: L2: r2=[B]; S2: [A]=1
+Outcome to Check: r1=1, r2=1
+The Cycle: L1 -po-> S1 -rf-> L2 -po-> S2 -rf-> L1
+TSO: Forbidden.
+RVWMO: Allowed (unless a data dependency exists between the Load and the Store).
+5. IRIW (Independent Reads of Independent Writes)
+Description: Two separate harts write to different addresses. Two other harts observe them in opposite orders.
+Code: * Hart 0: S1: [A]=1
+Hart 1: S2: [B]=1
+Hart 2: L1: r1=[A] (1); L2: r2=[B] (0)
+Hart 3: L3: r3=[B] (1); L4: r4=[A] (0)
+Outcome to Check: Hart 2 sees A before B; Hart 3 sees B before A.
+The Cycle: S1 -rf-> L1 -po-> L2 -fr-> S2 -rf-> L3 -po-> L4 -fr-> S1
+TSO: Forbidden.
+RVWMO: Forbidden (due to Multi-copy Atomicity).
+6. CoRR (Coherence Read-Read)
+Description: A single hart reads the same address twice and sees the value "revert" to an older state.
+Code: * Hart 0: S1: [A]=1
+Hart 1: L1: r1=[A] (1); L2: r2=[A] (0)
+Outcome to Check: r1=1, r2=0
+The Cycle: S_init -co-> S1 -rf-> L1 -po-> L2 -fr-> S1
+TSO: Forbidden.
+RVWMO: Forbidden (Coherence must always be maintained).
+
+Checker Implementation Tip
+When you copy these to your checker logic, remember that for RVWMO, the po relation in these text strings is only "enforced" if it qualifies as PPO (Preserved Program Order).
+For example, in MP, the checker sees S1 -po-> S2. It should only treat that as a solid link if there is a fence w, w or if S2 is a .release operation. If it's just a regular store, the checker should treat that link as "broken" and allow the cycle.
+Would you like me to provide the specific RISC-V assembly for one of these so you can see exactly where the fences go?
+ 
