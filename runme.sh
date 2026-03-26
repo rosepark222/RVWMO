@@ -1,0 +1,1 @@
+python3 -m pytest test_rvwmo_v4.py::test_inconsistent_merged_value_should_fail  -s
