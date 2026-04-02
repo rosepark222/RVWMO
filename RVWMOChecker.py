@@ -473,9 +473,17 @@ class RVWMOChecker:
             else dict(self.seen[hart])
         )
 
+        # Build the seen snapshot for this hart
+        seen_local = dict(self.seen[hart])
+
         candidates = self.ses[address]
         load_value, tbd = self._align_value(load.value, load.address, 8)
-        strict_seen = prev is not None and getattr(prev, 'ftype', None) in (FENCE_R, FENCE_RW, FENCE_TSO)
+
+        # RISC-V fences DO NOT impose visibility constraints
+        # I don't understand why copilot added this to confuse the logic. 
+        # strict_seen = prev is not None and getattr(prev, 'ftype', None) in (FENCE_R, FENCE_RW, FENCE_TSO)
+        strict_seen = False
+
         seen_for_search = dict(self.seen[hart]) if strict_seen else current_seen
         if self.debug:
             print(f"\nDEBUG process_load L{load.order}: hart={hart}, addr=0x{address:x}")
@@ -487,6 +495,12 @@ class RVWMOChecker:
             print(f"  candidates={[(f'S{c.order}@v{c.value}', f'hart{c.hart}') for c in candidates]}")
         result = self.search_rf_and_co(load, candidates, seen_for_search, strict_seen=strict_seen)
 
+
+        if result is None:
+            # → Try merge-aware fallback
+            result = self.fallback_merge_aware(load, candidates, seen_local)
+
+
         if result is None:
             self.violations.append(
                 f"VIOLATION: no valid rf source (hart={hart}, addr=0x{address:x})"
@@ -496,16 +510,37 @@ class RVWMOChecker:
             self.event_count += 1
             return
 
-        # commit RF and FR
-        self._add_edge(result.rf_source.order, load.order, RF)
+        # # commit RF and FR
+        # self._add_edge(result.rf_source.order, load.order, RF)
+        # for store in candidates:
+        #     if store.order == result.rf_source.order:
+        #         continue
+        #     if store.hart == result.rf_source.hart:
+        #         if store.order > result.rf_source.order:
+        #             self._add_edge(load.order, store.order, FR)
+        #     else:
+        #         self._add_edge(load.order, store.order, FR)
+
+
+        # ----------------- RF (supports single-store or merge) -------------------
+        # Ensure the commit logic supports both single‑store and merged rf_source forms.
+        if isinstance(result.rf_source, StoreEvent):
+            # normal path
+            src = result.rf_source
+            self._add_edge(src.order, load.order, RF)
+            contributing = [src]
+        else:
+            # merge-aware path: rf_source is dict {byte : store}
+            contributing = list(result.rf_source.values())
+            for st in contributing:
+                self._add_edge(st.order, load.order, RF)
+
+        # ----------------- FR edges -------------------
         for store in candidates:
-            if store.order == result.rf_source.order:
-                continue
-            if store.hart == result.rf_source.hart:
-                if store.order > result.rf_source.order:
+            for st in contributing:
+                # if store.order > st.order:
+                if store not in contributing and store.order > st.order:
                     self._add_edge(load.order, store.order, FR)
-            else:
-                self._add_edge(load.order, store.order, FR)
 
         # update global SEEN
         seen_delta = {}
@@ -517,8 +552,11 @@ class RVWMOChecker:
         # record per-load delta (v3+v4)
         self.seen_at_load[load.order] = seen_delta
 
-        # taint downstream
-        self.taint[dst_reg] = {result.rf_source.order}
+        # # taint downstream
+        # self.taint[dst_reg] = {result.rf_source.order}
+
+        # ----------------- Taint -------------------
+        self.taint[dst_reg] = {st.order for st in contributing}
 
         self.last_event[hart] = load
         self.recent_loads[hart].append(load)
@@ -847,6 +885,70 @@ class RVWMOChecker:
         self.event_count += 1
 
 
+    def fallback_merge_aware(self, load, candidates, seen):
+        """
+        Fallback merge-aware value explanation.
+        Activated ONLY when single-store RF search fails.
+
+        Tries to explain the load value per-byte using the latest store
+        (in terms of .order) among candidates that writes that byte.
+
+        Returns:
+            SearchResult(rf_source = None, new_seen=...)  OR None
+        """
+        load_value, _ = self._align_value(load.value, load.address, 8)
+
+        # 1) For each of 8 bytes, select the latest store (max order)
+        #    whose mask covers that byte AND whose value matches that byte.
+        byte_sources = {}      # byte_index -> store
+        for byte in range(8):
+            byte_mask = 0xFF << (8 * byte)
+            target_byte_val = load_value & byte_mask
+
+            latest_store = None
+            best_order   = -1
+
+            for s in candidates:
+                if s.mask & byte_mask:
+                    if (s.value & byte_mask) == target_byte_val:
+                        if s.order > best_order:
+                            latest_store = s
+                            best_order   = s.order
+
+            # If no store writes this byte → fallback fails
+            if latest_store is None:
+                return None
+
+            byte_sources[byte] = latest_store
+
+        # 2) Build temporary RF edges (one per byte)
+        temp_rf = [(st.order, load.order, RF) for st in byte_sources.values()]
+
+        # 3) Build FR edges: load -> all later stores for affected bytes
+        temp_fr = []
+        for s in candidates:
+            for (byte, src_st) in byte_sources.items():
+                byte_mask = 0xFF << (8 * byte)
+                if s.mask & byte_mask:
+                    if s.order > src_st.order:
+                        temp_fr.append((load.order, s.order, FR))
+
+        temp_edges = temp_rf + temp_fr
+
+        # 4) Cycle check
+        if self._creates_cycle(temp_edges):
+            return None
+
+        # 5) Compute new_seen
+        new_seen = dict(seen)
+        for st in byte_sources.values():
+            if st.order > new_seen.get(st.hart, 0):
+                new_seen[st.hart] = st.order
+
+        # Return special SearchResult with multi-store RF map
+        return SearchResult(rf_source=byte_sources, new_seen=new_seen)
+
+
     # =============================================================================
     # PRUNE
     # =============================================================================
@@ -923,8 +1025,25 @@ class RVWMOChecker:
             if v not in visited:
                 strongconnect(v)
 
-
     def _describe_cycle(self, scc):
+        parts = []
+        for o in scc:
+            e = self.dag[o].event
+
+            # Safe address formatting
+            addr = getattr(e, 'address', None)
+            if isinstance(addr, int):
+                addr_str = f"0x{addr:x}"
+            else:
+                addr_str = "?"
+
+            parts.append(
+                f"{e.etype}(hart={e.hart}, addr={addr_str}, order={e.order})"
+            )
+
+        return "CYCLE: " + " -> ".join(parts)
+
+    def _describe_cycle_xx(self, scc):
         parts = []
         for o in scc:
             e = self.dag[o].event
